@@ -130,6 +130,16 @@ function parseMsg(sender, content) {
 }
 
 // ── API YapsonPress ───────────────────────────────────────────
+// Normalise un timestamp YapsonPress en ms (l'API peut renvoyer secondes ou ms)
+function normTs(raw) {
+  if (!raw) return null;
+  let ts = typeof raw === 'string' ? parseFloat(raw) : Number(raw);
+  if (isNaN(ts)) return null;
+  // ts < 1e11 = secondes Unix (ex: 1746418380), convertir en ms
+  if (ts > 0 && ts < 1e11) ts = ts * 1000;
+  return ts;
+}
+
 async function yapsonFetchMessages(fromTs, toTs) {
   const token = state.yapsonToken;
   if (!token) throw new Error('YAPSON_TOKEN manquant — configurez-le dans le dashboard');
@@ -141,8 +151,7 @@ async function yapsonFetchMessages(fromTs, toTs) {
   const messages = Array.isArray(data) ? data : (data.messages || data.data || Object.values(data));
   return messages.filter(msg => {
     if (!SENDERS.some(s => (msg.sender || '').includes(s))) return false;
-    let ts = msg.timestamp;
-    if (!ts) ts = new Date(msg.created_at || msg.date || '').getTime();
+    const ts = normTs(msg.timestamp) || normTs(new Date(msg.created_at || msg.date || '').getTime());
     if (!ts || isNaN(ts)) return false;
     return ts >= fromTs && ts <= toTs;
   });
@@ -179,8 +188,7 @@ async function yapsonDeepSearch(phone, reqDateTs) {
       const parsed = parseMsg(sender, msg.content || msg.body || msg.message || '');
       if (!parsed) continue;
       if (normPhone(String(parsed.phone)) !== normPhone(String(phone))) continue;
-      let ts = msg.timestamp;
-      if (!ts) ts = new Date(msg.created_at || msg.date || '').getTime();
+      const ts = normTs(msg.timestamp) || normTs(new Date(msg.created_at || msg.date || '').getTime());
       if (!ts || isNaN(ts)) continue;
       candidates.push({
         phone: parsed.phone,
