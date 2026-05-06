@@ -454,24 +454,68 @@ async function runF3() {
   log('▶ F3 — Cycle complet YapsonSearch…');
   await ensureLoggedIn();
 
-  // ── ÉTAPE 1 : Lire les demandes en attente dans my-managment ─
-  log('F3 [1/5] Lecture du tableau Pending deposit requests…');
+  // ══════════════════════════════════════════════════════════════
+  // LOGIQUE : YapsonPress → my-managment
+  // 1. Fetch TOUS les paiements YapsonPress récents (large fenêtre)
+  // 2. Lire les demandes en attente dans my-managment
+  // 3. Pour chaque demande my-managment, chercher le paiement YapsonPress
+  //    correspondant (même numéro, paiement APRÈS la date de commande)
+  // 4. Si trouvé → confirmer (avec correction montant si besoin)
+  // 5. Si introuvable + âge >= seuil → DeepSearch puis rejeter si vide
+  // ══════════════════════════════════════════════════════════════
+
+  const marginMin = f3Config.marginMin;
+  const rejectMin = f3Config.rejectMin;
+  const now = Date.now();
+
+  // ── ÉTAPE 1 : Fetch TOUS les paiements YapsonPress récents ────
+  // Fenêtre large : depuis 24h en arrière jusqu'à maintenant
+  // (pas de toTs restrictif — on veut TOUS les paiements récents)
+  const yapFromTs = now - (24 * 60 * 60 * 1000); // 24h en arrière
+  const yapToTs   = now; // jusqu'à maintenant (pas de marge ici)
+  log(`F3 [1/5] Fetch YapsonPress (fenêtre 24h)…`);
+
+  let allYapMessages;
+  try {
+    allYapMessages = await yapsonFetchMessages(yapFromTs, yapToTs);
+  } catch(e) {
+    log(`F3 ❌ Erreur YapsonPress: ${e.message}`);
+    return;
+  }
+  log(`F3 — ${allYapMessages.length} message(s) YapsonPress dans les 24h`);
+
+  // Parser et indexer tous les paiements YapsonPress par numéro normalisé
+  // yapMap[phone] = [ { phone, amount, msgId, approved, sender, ts }, ... ]
+  const yapMap = {};
+  for (const msg of allYapMessages) {
+    const parsed = parseMsg(msg.sender || '', msg.content || msg.body || msg.message || '');
+    if (!parsed) continue;
+    const phone = normPhone(String(parsed.phone));
+    if (!phone) continue;
+    const ts = normTs(msg.timestamp) || normTs(new Date(msg.created_at || msg.date || '').getTime()) || 0;
+    if (!yapMap[phone]) yapMap[phone] = [];
+    yapMap[phone].push({
+      phone,
+      amount: parsed.amount,
+      msgId: msg.id || msg._id,
+      approved: msg.status === 'approuve' || msg.status === 'approved',
+      sender: msg.sender,
+      ts,
+    });
+  }
+  const yapPhones = Object.keys(yapMap);
+  log(`F3 — ${yapPhones.length} numéro(s) unique(s) dans YapsonPress : ${yapPhones.slice(0,8).join(' | ')}${yapPhones.length > 8 ? '…' : ''}`);
+
+  // ── ÉTAPE 2 : Lire les demandes en attente dans my-managment ──
+  log('F3 [2/5] Lecture du tableau Pending deposit requests…');
   await page.goto(`${MGMT_URL}/fr/admin/report/pendingrequestrefill`, { waitUntil: 'networkidle', timeout: 30000 });
 
-  // Désactiver l'autorefresh et charger 500 lignes
   try {
-    // Désactiver le toggle autorefresh
-    const toggleInput = await page.$('input[type="checkbox"].toggle, .toggle input, input#autoUpdate, input[class*="toggle"]');
-    if (toggleInput) {
-      const isOn = await toggleInput.isChecked();
-      if (isOn) await toggleInput.dispatchEvent('click');
-    } else {
-      const toggleEl = await page.$('.toggle--is-checked, [class*="toggle"][class*="active"]');
-      if (toggleEl) await toggleEl.dispatchEvent('click');
-    }
-    await page.waitForTimeout(500);
+    // Désactiver l'autorefresh
+    const toggleEl = await page.$('.toggle--is-checked, [class*="toggle"][class*="active"], input[type="checkbox"].toggle');
+    if (toggleEl) { await toggleEl.dispatchEvent('click'); await page.waitForTimeout(500); }
     // Sélectionner 500 lignes via le multiselect Vue.js
-    const ms = await page.$('.input-group.select-box .multiselect, .multiselect[data-v]');
+    const ms = await page.$('.input-group.select-box .multiselect');
     if (ms) {
       const current = await page.$eval('.multiselect__single', el => el.textContent.trim()).catch(() => '');
       if (current !== '500') {
@@ -479,8 +523,7 @@ async function runF3() {
         if (selectBtn) { await selectBtn.click(); await page.waitForTimeout(400); }
         const options = await ms.$$('.multiselect__element');
         for (const opt of options) {
-          const txt = (await opt.textContent()).trim();
-          if (txt === '500') { await opt.$('span')?.click(); break; }
+          if ((await opt.textContent()).trim() === '500') { await opt.$('span')?.click(); break; }
         }
         await page.waitForTimeout(300);
       }
@@ -489,258 +532,182 @@ async function runF3() {
     if (applyBtn) { await applyBtn.click(); await page.waitForTimeout(3000); }
   } catch(e) { log(`⚠ Setup tableau: ${e.message.substring(0, 80)}`); }
 
-  // Lire toutes les lignes
-  const pendingRows = await page.$$eval('table tbody tr', (trs) => {
-    return trs.map(tr => {
-      const cells = [...tr.querySelectorAll('td')].map(td => td.innerText.trim());
-      if (cells.length < 5) return null;
-      const hasConfirm = [...tr.querySelectorAll('a')].some(a => a.textContent.trim() === 'Confirmer');
-      if (!hasConfirm) return null;
-      const phoneMatch = (cells[1] || '').match(/0\d{9}/);
-      const phone = phoneMatch ? phoneMatch[0] : null;
-      if (!phone) return null;
-      return { date: cells[0], phone, amountRaw: cells[2] };
-    }).filter(Boolean);
-  });
-
-  if (pendingRows.length === 0) { log('F3 — Aucune demande en attente. Fin.'); return; }
-  log(`F3 — ${pendingRows.length} demande(s) en attente trouvée(s)`);
-
-  // ── ÉTAPE 2 : Trouver la plus ancienne demande → timestamp de départ ─
-  const now = Date.now();
-  let oldestTs = now;
-  let oldestStr = null;
-  for (const row of pendingRows) {
-    const d = parseMgmtDate(row.date);
-    if (d && !isNaN(d.getTime()) && d.getTime() < oldestTs) {
-      oldestTs = d.getTime();
-      oldestStr = row.date;
-    }
-  }
-  if (!oldestStr) { log('F3 ❌ Impossible de lire la date la plus ancienne. Fin.'); return; }
-  log(`F3 — Plus ancienne demande : ${oldestStr} (il y a ${((now - oldestTs) / 60000).toFixed(0)} min)`);
-
-  // ── ÉTAPE 3 : Fetch YapsonPress depuis oldestTs jusqu'à (now - marginMin) ─
-  const marginMin = f3Config.marginMin;
-  const rejectMin = f3Config.rejectMin;
-  const fromTs = oldestTs;
-  const toTs = now - (marginMin * 60 * 1000);
-  log(`F3 [2/5] Fetch YapsonPress de ${new Date(fromTs).toLocaleTimeString('fr-FR')} à ${new Date(toTs).toLocaleTimeString('fr-FR')} (marge ${marginMin}min)…`);
-
-  let yapMessages;
-  try {
-    yapMessages = await yapsonFetchMessages(fromTs, toTs);
-  } catch(e) {
-    log(`F3 ❌ Erreur YapsonPress: ${e.message}`);
-    return;
-  }
-  log(`F3 — ${yapMessages.length} message(s) YapsonPress dans la fenêtre`);
-
-  // Parser les messages YapsonPress → Map par numéro de téléphone
-  const payments = [];
-  for (const msg of yapMessages) {
-    const parsed = parseMsg(msg.sender || '', msg.content || msg.body || msg.message || '');
-    if (!parsed) continue;
-    payments.push({
-      phone: parsed.phone,
-      amount: parsed.amount,
-      msgId: msg.id || msg._id,
-      approved: msg.status === 'approuve' || msg.status === 'approved',
-      sender: msg.sender,
-    });
-  }
-  log(`F3 — ${payments.length} paiement(s) parsé(s) depuis YapsonPress : ${payments.map(p => `${p.phone}→${fmtAmt(p.amount)}F`).join(' | ')}`);
-
-  // ── ÉTAPE 4 : Approuver dans YapsonPress les paiements non encore approuvés ─
+  // ── ÉTAPE 3 : Approuver dans YapsonPress les paiements non encore approuvés ─
   log('F3 [3/5] Approbation dans YapsonPress…');
   let approvedCount = 0;
-  for (const p of payments) {
-    if (!p.approved && p.msgId) {
-      const ok = await yapsonApprove(p.msgId);
-      if (ok) { approvedCount++; p.approved = true; }
+  for (const phone of yapPhones) {
+    for (const p of yapMap[phone]) {
+      if (!p.approved && p.msgId) {
+        const ok = await yapsonApprove(p.msgId);
+        if (ok) { approvedCount++; p.approved = true; }
+      }
     }
   }
   log(`F3 — ${approvedCount} paiement(s) approuvé(s) dans YapsonPress`);
   state.approved += approvedCount;
 
-  // Construire un Map phone → liste de paiements YapsonPress
-  const yapMap = {};
-  for (const p of payments) {
-    if (!yapMap[p.phone]) yapMap[p.phone] = [];
-    yapMap[p.phone].push(p);
-  }
-
-  // ── ÉTAPE 5 : Confirmer/rejeter dans my-managment ─────────────
+  // ── ÉTAPE 4 : YapsonPress → my-managment ────────────────────
+  // Itérer sur les PAIEMENTS YapsonPress, chercher la commande
+  // correspondante dans my-managment.
+  // Règle : le paiement doit être POSTÉRIEUR à la commande.
+  // Un client peut payer jusqu'à rejectMin minutes après sa commande.
   log('F3 [4/5] Confirmation des demandes dans my-managment…');
-  // Recharger la page pour avoir les données fraîches
-  if (!page.url().includes('pendingrequestrefill')) {
-    await page.goto(`${MGMT_URL}/fr/admin/report/pendingrequestrefill`, { waitUntil: 'networkidle', timeout: 30000 });
-    await page.waitForTimeout(1000);
-  }
-
   let confirmedCount = 0;
-  let rejectedCount = 0;
+  let rejectedCount  = 0;
+
+  // Lire toutes les lignes my-managment en mémoire (pour accès multiple)
+  const mgmtRows = [];
   const rowLocators = page.locator('table tbody tr');
   const rowCount = await rowLocators.count();
-
   for (let ri = 0; ri < rowCount; ri++) {
-    const rowHandle = rowLocators.nth(ri);
     try {
+      const rowHandle = rowLocators.nth(ri);
       const cells = await rowHandle.locator('td').allInnerTexts();
       if (cells.length < 5) continue;
-
-      // Extraire téléphone et montant de my-managment
       const phoneMatch = (cells[1] || '').match(/(0\d{9})/);
       if (!phoneMatch) continue;
-      const reqPhone = normPhone(phoneMatch[1]);
-      const reqAmount = parseAmount(cells[2]);
-      const reqDate = parseMgmtDate(cells[0]);
-      const ageMin = reqDate ? (now - reqDate.getTime()) / 60000 : 999;
+      const hasConfirm = (await rowHandle.locator('a').allInnerTexts()).some(t => t.trim() === 'Confirmer');
+      if (!hasConfirm) continue;
+      mgmtRows.push({
+        ri,
+        phone:   normPhone(phoneMatch[1]),
+        amount:  parseAmount(cells[2]),
+        dateTs:  parseMgmtDate(cells[0])?.getTime() ?? (now - 60 * 60 * 1000),
+        handle:  rowHandle,
+      });
+    } catch(e) { /* ignorer les lignes illisibles */ }
+  }
+  log(`F3 — ${mgmtRows.length} demande(s) en attente dans my-managment`);
 
-      // Chercher ce numéro dans les paiements YapsonPress
-      const yapMatches = yapMap[reqPhone];
+  // Ensemble des lignes déjà confirmées (éviter double-confirmation)
+  const confirmedRows = new Set();
 
-      if (yapMatches && yapMatches.length > 0) {
-        // Trouver le meilleur match (exact d'abord, sinon le plus proche)
-        const exactMatch = yapMatches.find(p => p.amount === reqAmount);
-        const best = exactMatch || yapMatches.reduce((a, b) =>
-          Math.abs(a.amount - (reqAmount || 0)) <= Math.abs(b.amount - (reqAmount || 0)) ? a : b
-        );
+  // ── Itérer sur les paiements YapsonPress ──────────────────────
+  // Pour chaque paiement YapsonPress : chercher la commande my-managment
+  // dont le numéro correspond ET dont le paiement est postérieur (≥ dateCommande).
+  for (const phone of yapPhones) {
+    for (const pmt of yapMap[phone]) {
+      // Règle : pmt.ts >= row.dateTs  →  le paiement est après la commande
+      // Pas de borne haute ici : c'est rejectMin qui décide du rejet éventuel
+      const match = mgmtRows.find(row =>
+        !confirmedRows.has(row.ri) &&
+        row.phone === pmt.phone &&
+        pmt.ts >= row.dateTs
+      );
 
-        // Montant à appliquer : celui de YapsonPress, plafonné à 200 000
-        let montantFinal = best.amount;
-        if (montantFinal > 200000) {
-          log(`F3 ⚠ Montant YapsonPress ${fmtAmt(montantFinal)}F > 200 000 → plafonné à 200 000F`);
-          montantFinal = 200000;
+      if (!match) continue; // ce paiement n'a pas de demande dans my-managment
+
+      // Montant à appliquer : celui de YapsonPress, plafonné à 200 000
+      let montantFinal = pmt.amount;
+      if (montantFinal > 200000) {
+        log(`F3 ⚠ Montant ${fmtAmt(montantFinal)}F > 200 000 → plafonné`);
+        montantFinal = 200000;
+      }
+      if (match.amount !== montantFinal) {
+        log(`F3 — Correction ${pmt.phone}: my-managment=${fmtAmt(match.amount)}F → YapsonPress=${fmtAmt(montantFinal)}F`);
+      }
+
+      // ── Confirmer dans my-managment ───────────────────────────
+      try {
+        let confirmLink = null;
+        for (const a of await match.handle.locator('a').all()) {
+          if ((await a.textContent()).trim() === 'Confirmer') { confirmLink = a; break; }
+        }
+        if (!confirmLink) { log(`F3 ⚠ Lien Confirmer non trouvé pour ${pmt.phone}`); continue; }
+        await confirmLink.click();
+        await page.waitForTimeout(800);
+
+        const modalBtn = await waitModalConfirmBtn(15000);
+        if (!modalBtn) { log(`F3 ⚠ Modale non trouvée pour ${pmt.phone}`); continue; }
+
+        if (match.amount !== montantFinal) {
+          await fixModalAmount(montantFinal);
+          await page.waitForTimeout(300);
         }
 
-        if (reqAmount !== montantFinal) {
-          log(`F3 — Correction montant ${reqPhone}: my-managment=${fmtAmt(reqAmount)}F → YapsonPress=${fmtAmt(montantFinal)}F`);
-        }
+        await modalBtn.click();
+        await waitModalClose(15000);
+        await page.waitForTimeout(1000);
 
-        // Cliquer sur "Confirmer" dans la ligne
+        confirmedRows.add(match.ri);
+        confirmedCount++;
+        log(`F3 ✅ Confirmé : ${pmt.phone} → ${fmtAmt(montantFinal)}F (${pmt.sender})`);
+      } catch(e) { log(`⚠ Confirmation ${pmt.phone}: ${e.message.substring(0, 80)}`); }
+    }
+  }
+
+  // ── Traiter les demandes non confirmées (rejet ou attente) ────
+  for (const row of mgmtRows) {
+    if (confirmedRows.has(row.ri)) continue; // déjà traitée
+    const ageMin = (now - row.dateTs) / 60000;
+
+    if (ageMin >= rejectMin) {
+      // DeepSearch avant tout rejet
+      log(`F3 🔍 DeepSearch avant rejet : ${row.phone} (âge ${ageMin.toFixed(0)} min)…`);
+      const deepResult = await yapsonDeepSearch(row.phone, row.dateTs);
+
+      if (deepResult.found && deepResult.payment) {
+        const dp = deepResult.payment;
+        let montantDeep = dp.amount > 200000 ? 200000 : dp.amount;
+        log(`F3 🔍 Trouvé chez ${dp.sender} → ${fmtAmt(montantDeep)}F — CONFIRMATION au lieu de rejet`);
+        if (!dp.approved && dp.msgId) await yapsonApprove(dp.msgId);
+
         try {
           let confirmLink = null;
-          for (const a of await rowHandle.locator('a').all()) {
+          for (const a of await row.handle.locator('a').all()) {
             if ((await a.textContent()).trim() === 'Confirmer') { confirmLink = a; break; }
           }
-          if (!confirmLink) { log(`F3 ⚠ Lien Confirmer non trouvé pour ${reqPhone}`); continue; }
+          if (!confirmLink) { log(`F3 ⚠ Lien Confirmer (deep) non trouvé pour ${row.phone}`); continue; }
           await confirmLink.click();
           await page.waitForTimeout(800);
-
-          // Attendre l'apparition du bouton CONFIRMER dans la modale
           const modalBtn = await waitModalConfirmBtn(15000);
-          if (!modalBtn) { log(`F3 ⚠ Modale CONFIRMER non trouvée pour ${reqPhone}`); continue; }
-
-          // Si montant différent : corriger dans la modale AVANT de cliquer
-          if (reqAmount !== montantFinal) {
-            await fixModalAmount(montantFinal);
+          if (!modalBtn) { log(`F3 ⚠ Modale (deep) non trouvée pour ${row.phone}`); continue; }
+          if (row.amount !== montantDeep) {
+            await fixModalAmount(montantDeep);
             await page.waitForTimeout(300);
           }
-
-          // Cliquer sur CONFIRMER dans la modale
           await modalBtn.click();
-
-          // Attendre la fermeture de la modale
           await waitModalClose(15000);
           await page.waitForTimeout(1000);
-
+          confirmedRows.add(row.ri);
           confirmedCount++;
-          log(`F3 ✅ Confirmé : ${reqPhone} → ${fmtAmt(montantFinal)}F`);
-        } catch(e) { log(`⚠ Confirmation ${reqPhone}: ${e.message.substring(0, 80)}`); }
+          log(`F3 ✅ Confirmé (DeepSearch) : ${row.phone} → ${fmtAmt(montantDeep)}F`);
+        } catch(e) { log(`⚠ Confirmation deep ${row.phone}: ${e.message.substring(0, 80)}`); }
 
       } else {
-        // Numéro PAS dans la fenêtre YapsonPress principale
-        if (ageMin >= rejectMin) {
-          // ── VÉRIFICATION APPROFONDIE avant tout rejet ──────────────
-          // Chercher le numéro dans TOUS les expéditeurs YapsonPress,
-          // sans restriction de date, en vérifiant que le paiement
-          // est postérieur ou contemporain à la commande.
-          log(`F3 🔍 DeepSearch avant rejet : ${reqPhone} (âge ${ageMin.toFixed(0)} min)…`);
-          const reqDateTs = reqDate ? reqDate.getTime() : (now - ageMin * 60000);
-          const deepResult = await yapsonDeepSearch(reqPhone, reqDateTs);
-
-          if (deepResult.found && deepResult.payment) {
-            // Paiement trouvé APRÈS la commande → confirmer au lieu de rejeter
-            const dp = deepResult.payment;
-            let montantDeep = dp.amount;
-            if (montantDeep > 200000) {
-              log(`F3 ⚠ DeepSearch montant ${fmtAmt(montantDeep)}F > 200 000 → plafonné`);
-              montantDeep = 200000;
-            }
-            log(`F3 🔍 DeepSearch ${reqPhone} : paiement trouvé chez ${dp.sender} le ${new Date(dp.ts).toLocaleTimeString('fr-FR')} → ${fmtAmt(montantDeep)}F — CONFIRMATION au lieu de rejet`);
-
-            // Approuver dans YapsonPress si pas encore fait
-            if (!dp.approved && dp.msgId) {
-              await yapsonApprove(dp.msgId);
-            }
-
-            try {
-              let confirmLink = null;
-              for (const a of await rowHandle.locator('a').all()) {
-                if ((await a.textContent()).trim() === 'Confirmer') { confirmLink = a; break; }
-              }
-              if (!confirmLink) { log(`F3 ⚠ Lien Confirmer (deep) non trouvé pour ${reqPhone}`); continue; }
-              await confirmLink.click();
-              await page.waitForTimeout(800);
-
-              const modalBtn = await waitModalConfirmBtn(15000);
-              if (!modalBtn) { log(`F3 ⚠ Modale CONFIRMER (deep) non trouvée pour ${reqPhone}`); continue; }
-
-              // Corriger le montant si différent
-              if (reqAmount !== montantDeep) {
-                await fixModalAmount(montantDeep);
-                await page.waitForTimeout(300);
-              }
-
-              await modalBtn.click();
-              await waitModalClose(15000);
-              await page.waitForTimeout(1000);
-
-              confirmedCount++;
-              log(`F3 ✅ Confirmé (via DeepSearch) : ${reqPhone} → ${fmtAmt(montantDeep)}F`);
-            } catch(e) { log(`⚠ Confirmation deep ${reqPhone}: ${e.message.substring(0, 80)}`); }
-
-          } else {
-            // Vraiment introuvable → rejeter
-            log(`F3 — Rejet définitif: ${reqPhone} introuvable dans YapsonPress (tous expéditeurs), âge ${ageMin.toFixed(0)} min`);
-            try {
-              let rejectLink = null;
-              for (const a of await rowHandle.locator('a').all()) {
-                if ((await a.textContent()).trim() === 'Rejeter') { rejectLink = a; break; }
-              }
-              if (!rejectLink) { log(`F3 ⚠ Lien Rejeter non trouvé pour ${reqPhone}`); continue; }
-              await rejectLink.click();
-              let okBtn = null;
-              for (let i = 0; i < 40; i++) {
-                for (const b of await page.$$('button, a.btn, .btn')) {
-                  try {
-                    if ((await b.textContent()).trim() === 'OK' && await b.isVisible()) { okBtn = b; break; }
-                  } catch { /* ignore */ }
-                }
-                if (okBtn) break;
-                await page.waitForTimeout(200);
-              }
-              if (!okBtn) { log(`F3 ⚠ Bouton OK rejet non trouvé pour ${reqPhone}`); continue; }
-              await page.waitForTimeout(300);
-              const ci = await page.$('input[placeholder="Commentaire"], textarea[placeholder="Commentaire"]');
-              if (ci) { await ci.fill('Expiré'); await page.waitForTimeout(200); }
-              for (const b of await page.$$('button, a.btn, .btn')) {
-                try {
-                  if ((await b.textContent()).trim() === 'OK' && await b.isVisible()) { await b.click(); break; }
-                } catch { /* ignore */ }
-              }
-              await page.waitForTimeout(2000);
-              rejectedCount++;
-              log(`F3 ❌ Rejeté: ${reqPhone} (âge: ${ageMin.toFixed(0)} min)`);
-            } catch(e) { log(`⚠ Rejet ${reqPhone}: ${e.message.substring(0, 80)}`); }
+        // Vraiment introuvable → rejeter
+        log(`F3 — Rejet définitif: ${row.phone} (âge ${ageMin.toFixed(0)} min, introuvable partout)`);
+        try {
+          let rejectLink = null;
+          for (const a of await row.handle.locator('a').all()) {
+            if ((await a.textContent()).trim() === 'Rejeter') { rejectLink = a; break; }
           }
-
-        } else {
-          log(`F3 ⏳ En attente: ${reqPhone} introuvable (fenêtre principale) — âge ${ageMin.toFixed(0)} min < ${rejectMin} min`);
-        }
+          if (!rejectLink) { log(`F3 ⚠ Lien Rejeter non trouvé pour ${row.phone}`); continue; }
+          await rejectLink.click();
+          let okBtn = null;
+          for (let i = 0; i < 40; i++) {
+            for (const b of await page.$$('button, a.btn, .btn')) {
+              try { if ((await b.textContent()).trim() === 'OK' && await b.isVisible()) { okBtn = b; break; } } catch {}
+            }
+            if (okBtn) break;
+            await page.waitForTimeout(200);
+          }
+          if (!okBtn) { log(`F3 ⚠ Bouton OK rejet non trouvé pour ${row.phone}`); continue; }
+          await page.waitForTimeout(300);
+          const ci = await page.$('input[placeholder="Commentaire"], textarea[placeholder="Commentaire"]');
+          if (ci) { await ci.fill('Expiré'); await page.waitForTimeout(200); }
+          for (const b of await page.$$('button, a.btn, .btn')) {
+            try { if ((await b.textContent()).trim() === 'OK' && await b.isVisible()) { await b.click(); break; } } catch {}
+          }
+          await page.waitForTimeout(2000);
+          rejectedCount++;
+          log(`F3 ❌ Rejeté: ${row.phone} (âge: ${ageMin.toFixed(0)} min)`);
+        } catch(e) { log(`⚠ Rejet ${row.phone}: ${e.message.substring(0, 80)}`); }
       }
-    } catch(e) { log(`⚠ Erreur ligne ${ri}: ${e.message.substring(0, 80)}`); }
+
+    } else {
+      log(`F3 ⏳ En attente: ${row.phone} introuvable — âge ${ageMin.toFixed(0)} min < ${rejectMin} min`);
+    }
   }
 
   log(`F3 [5/5] ✅ Résultat : ${confirmedCount} confirmé(s), ${rejectedCount} rejeté(s), ${approvedCount} approuvé(s) YapsonPress`);
