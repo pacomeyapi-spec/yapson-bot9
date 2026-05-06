@@ -130,13 +130,25 @@ function parseMsg(sender, content) {
 }
 
 // ── API YapsonPress ───────────────────────────────────────────
-// Normalise un timestamp YapsonPress en ms (l'API peut renvoyer secondes ou ms)
+// Normalise un timestamp YapsonPress en ms
+// Gère : nombre en ms, nombre en secondes, string ISO ("2026-05-06T00:42:00Z"), string numérique
 function normTs(raw) {
   if (!raw) return null;
-  let ts = typeof raw === 'string' ? parseFloat(raw) : Number(raw);
-  if (isNaN(ts)) return null;
-  // ts < 1e11 = secondes Unix (ex: 1746418380), convertir en ms
-  if (ts > 0 && ts < 1e11) ts = ts * 1000;
+  let ts;
+  if (typeof raw === 'string') {
+    // Essayer d'abord comme date ISO / string de date
+    const d = new Date(raw);
+    if (!isNaN(d.getTime()) && d.getTime() > 1e12) {
+      return d.getTime(); // date ISO valide en ms
+    }
+    // Sinon essayer comme nombre
+    ts = parseFloat(raw);
+  } else {
+    ts = Number(raw);
+  }
+  if (isNaN(ts) || ts <= 0) return null;
+  // ts < 1e11 = secondes Unix → convertir en ms
+  if (ts < 1e11) ts = ts * 1000;
   return ts;
 }
 
@@ -152,15 +164,15 @@ async function yapsonFetchMessages(fromTs, toTs) {
   log(`F3 🔎 API YapsonPress : ${messages.length} messages bruts, premier champs: ${messages[0] ? Object.keys(messages[0]).join(',') : 'vide'}`);
   const filtered = messages.filter(msg => {
     if (!SENDERS.some(s => (msg.sender || '').includes(s))) return false;
-    // Essayer tous les champs de date possibles
+    // Essayer tous les champs de date dans l'ordre de priorité
+    // normTs gère maintenant : string ISO, secondes, millisecondes
     const ts = normTs(msg.timestamp)
+            || normTs(msg.received_at)
             || normTs(msg.createdAt)
             || normTs(msg.created_at)
             || normTs(msg.date)
-            || normTs(msg.time)
-            || normTs(new Date(msg.created_at || msg.createdAt || msg.date || '').getTime());
-    // Si aucun timestamp trouvé, inclure quand même (le message est récent par définition)
-    if (!ts || isNaN(ts)) return true;
+            || normTs(msg.time);
+    if (!ts || isNaN(ts)) return false; // pas de date = exclure
     return ts >= fromTs && ts <= toTs;
   });
   return filtered;
@@ -198,10 +210,11 @@ async function yapsonDeepSearch(phone, reqDateTs) {
       if (!parsed) continue;
       if (normPhone(String(parsed.phone)) !== normPhone(String(phone))) continue;
       const ts = normTs(msg.timestamp)
+              || normTs(msg.received_at)
               || normTs(msg.createdAt)
               || normTs(msg.created_at)
               || normTs(msg.date)
-              || normTs(new Date(msg.created_at || msg.createdAt || msg.date || '').getTime())
+              || normTs(msg.time)
               || Date.now();
       if (!ts || isNaN(ts)) continue;
       candidates.push({
@@ -540,11 +553,13 @@ async function runF3() {
   log(`F3 — Plus ancienne demande : ${oldestStr} → référence YapsonPress`);
 
   // Fetch YapsonPress depuis la plus ancienne commande jusqu'à (now - marginMin)
-  // La marge exclut les paiements trop récents — ils seront pris au prochain cycle
-  const yapFromTs = oldestTs;
+  // YapsonPress n'a pas les secondes (précision à la minute) — on arrondit
+  // fromTs à la minute basse pour ne pas rater les paiements de la même minute
+  const yapFromTs = Math.floor(oldestTs / 60000) * 60000; // arrondi à la minute basse
   const yapToTs   = now - (marginMin * 60 * 1000);
-  const toStr     = new Date(yapToTs).toLocaleTimeString('fr-FR');
-  log(`F3 [1/5→] Fetch YapsonPress de ${oldestStr} à ${toStr} (marge ${marginMin} min)…`);
+  const fromStrYap = new Date(yapFromTs).toLocaleTimeString('fr-FR');
+  const toStr      = new Date(yapToTs).toLocaleTimeString('fr-FR');
+  log(`F3 [1/5→] Fetch YapsonPress de ${fromStrYap} à ${toStr} (marge ${marginMin} min)…`);
 
   let allYapMessages;
   try {
@@ -563,14 +578,14 @@ async function runF3() {
     if (!parsed) continue;
     const phone = normPhone(String(parsed.phone));
     if (!phone) continue;
-    // Essayer tous les champs de date possibles
+    // Résoudre le timestamp (normTs gère ISO, secondes, ms)
     const ts = normTs(msg.timestamp)
+            || normTs(msg.received_at)
             || normTs(msg.createdAt)
             || normTs(msg.created_at)
             || normTs(msg.date)
             || normTs(msg.time)
-            || normTs(new Date(msg.created_at || msg.createdAt || msg.date || '').getTime())
-            || now; // si aucun timestamp, considérer comme maintenant
+            || now;
     if (!yapMap[phone]) yapMap[phone] = [];
     yapMap[phone].push({
       phone,
