@@ -606,20 +606,9 @@ async function runF3() {
   log(`F3 — ${yapPhones.length} numéro(s) unique(s) dans YapsonPress : ${yapPhones.slice(0,8).join(' | ')}${yapPhones.length > 8 ? '…' : ''}`);
 
   // ── ÉTAPE 2 : (my-managment déjà lu à l'étape 1) ───────────────
-
-  // ── ÉTAPE 3 : Approuver dans YapsonPress les paiements non encore approuvés ─
-  log('F3 [3/5] Approbation dans YapsonPress…');
+  // NOTE : l'approbation YapsonPress se fait APRÈS confirmation my-managment
+  // pour ne pas marquer "approuvé" des paiements pas encore traités.
   let approvedCount = 0;
-  for (const phone of yapPhones) {
-    for (const p of yapMap[phone]) {
-      if (!p.approved && p.msgId) {
-        const ok = await yapsonApprove(p.msgId);
-        if (ok) { approvedCount++; p.approved = true; }
-      }
-    }
-  }
-  log(`F3 — ${approvedCount} paiement(s) approuvé(s) dans YapsonPress`);
-  state.approved += approvedCount;
 
   // ── ÉTAPE 4 : YapsonPress → my-managment ────────────────────
   // Itérer sur les paiements YapsonPress (depuis la date de référence),
@@ -633,7 +622,9 @@ async function runF3() {
 
   // ── Itérer sur les paiements YapsonPress ──────────────────────
   // Pour chaque paiement YapsonPress : chercher la commande my-managment
-  // dont le numéro correspond ET dont le paiement est postérieur (≥ dateCommande).
+  // dont le numéro correspond.
+  log(`F3 — Numéros YapsonPress dans la fenêtre : ${yapPhones.join(' | ')}`);
+  log(`F3 — Numéros my-managment en attente : ${mgmtRows.map(r => r.phone).join(' | ')}`);
   for (const phone of yapPhones) {
     for (const pmt of yapMap[phone]) {
       // Le filtre de date est déjà fait via yapFromTs = date plus ancienne commande.
@@ -643,7 +634,10 @@ async function runF3() {
         row.phone === pmt.phone
       );
 
-      if (!match) continue; // ce paiement n'a pas de demande dans my-managment
+      if (!match) {
+        log(`F3 ⏩ YapsonPress ${pmt.phone} (${fmtAmt(pmt.amount)}F, ${pmt.sender}) — aucune commande my-managment correspondante`);
+        continue;
+      }
 
       // Montant à appliquer : celui de YapsonPress, plafonné à 200 000
       let montantFinal = pmt.amount;
@@ -679,6 +673,11 @@ async function runF3() {
 
         confirmedRows.add(match.ri);
         confirmedCount++;
+        // Approuver dans YapsonPress APRÈS confirmation réussie
+        if (!pmt.approved && pmt.msgId) {
+          const ok = await yapsonApprove(pmt.msgId);
+          if (ok) { approvedCount++; pmt.approved = true; }
+        }
         log(`F3 ✅ Confirmé : ${pmt.phone} → ${fmtAmt(montantFinal)}F (${pmt.sender})`);
       } catch(e) { log(`⚠ Confirmation ${pmt.phone}: ${e.message.substring(0, 80)}`); }
     }
@@ -719,6 +718,11 @@ async function runF3() {
           await page.waitForTimeout(1000);
           confirmedRows.add(row.ri);
           confirmedCount++;
+          // Approuver dans YapsonPress APRÈS confirmation réussie
+          if (!dp.approved && dp.msgId) {
+            const ok = await yapsonApprove(dp.msgId);
+            if (ok) { approvedCount++; }
+          }
           log(`F3 ✅ Confirmé (DeepSearch) : ${row.phone} → ${fmtAmt(montantDeep)}F`);
         } catch(e) { log(`⚠ Confirmation deep ${row.phone}: ${e.message.substring(0, 80)}`); }
 
@@ -758,6 +762,7 @@ async function runF3() {
     }
   }
 
+  state.approved += approvedCount;
   log(`F3 [5/5] ✅ Résultat : ${confirmedCount} confirmé(s), ${rejectedCount} rejeté(s), ${approvedCount} approuvé(s) YapsonPress`);
   state.confirmed += confirmedCount;
   state.rejected += rejectedCount;
