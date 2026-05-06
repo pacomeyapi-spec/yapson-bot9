@@ -18,6 +18,12 @@ const YAPSON_URL = (process.env.YAPSON_URL || 'https://sms-mirror-production.up.
 const MGMT_URL = (process.env.MGMT_URL || 'https://my-managment.com').replace(/\/$/, '');
 const FONCTION = (process.env.FONCTION || 'F1').toUpperCase();
 const SENDERS = (process.env.SENDERS || 'Wave Business,+454,MobileMoney,MoovMoney').split(',').map(s => s.trim());
+
+// Retourne le nom d'expéditeur effectif d'un message YapsonPress
+// L'API peut mettre sender=null et mettre le nom dans app_name (ex: Wave Business)
+function getMsgSender(msg) {
+  return msg.sender || msg.app_name || msg.sender_name || msg.device_name || '';
+}
 const INTERVAL_SEC = parseInt(process.env.INTERVAL_SEC || '30', 10);
 
 // F2 options
@@ -163,7 +169,7 @@ async function yapsonFetchMessages(fromTs, toTs) {
   const messages = Array.isArray(data) ? data : (data.messages || data.data || Object.values(data));
   log(`F3 🔎 API YapsonPress : ${messages.length} messages bruts, premier champs: ${messages[0] ? Object.keys(messages[0]).join(',') : 'vide'}`);
   const filtered = messages.filter(msg => {
-    if (!SENDERS.some(s => (msg.sender || '').includes(s))) return false;
+    if (!SENDERS.some(s => getMsgSender(msg).includes(s))) return false;
     // Essayer tous les champs de date dans l'ordre de priorité
     // normTs gère maintenant : string ISO, secondes, millisecondes
     const ts = normTs(msg.timestamp)
@@ -204,7 +210,7 @@ async function yapsonDeepSearch(phone, reqDateTs) {
     // Parcourir TOUS les expéditeurs, sans filtre de date
     const candidates = [];
     for (const msg of messages) {
-      const sender = msg.sender || '';
+      const sender = getMsgSender(msg);
       if (!SENDERS.some(s => sender.includes(s))) continue;
       const parsed = parseMsg(sender, msg.content || msg.body || msg.message || '');
       if (!parsed) continue;
@@ -574,7 +580,7 @@ async function runF3() {
   // yapMap[phone] = [ { phone, amount, msgId, approved, sender, ts }, ... ]
   const yapMap = {};
   for (const msg of allYapMessages) {
-    const parsed = parseMsg(msg.sender || '', msg.content || msg.body || msg.message || '');
+    const parsed = parseMsg(getMsgSender(msg), msg.content || msg.body || msg.message || '');
     if (!parsed) continue;
     const phone = normPhone(String(parsed.phone));
     if (!phone) continue;
@@ -592,7 +598,7 @@ async function runF3() {
       amount: parsed.amount,
       msgId: msg.id || msg._id,
       approved: msg.status === 'approuve' || msg.status === 'approved',
-      sender: msg.sender,
+      sender: getMsgSender(msg),
       ts,
     });
   }
