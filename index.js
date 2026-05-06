@@ -149,12 +149,21 @@ async function yapsonFetchMessages(fromTs, toTs) {
   if (!res.ok) throw new Error(`YapsonPress API ${res.status}`);
   const data = await res.json();
   const messages = Array.isArray(data) ? data : (data.messages || data.data || Object.values(data));
-  return messages.filter(msg => {
+  log(`F3 🔎 API YapsonPress : ${messages.length} messages bruts, premier champs: ${messages[0] ? Object.keys(messages[0]).join(',') : 'vide'}`);
+  const filtered = messages.filter(msg => {
     if (!SENDERS.some(s => (msg.sender || '').includes(s))) return false;
-    const ts = normTs(msg.timestamp) || normTs(new Date(msg.created_at || msg.date || '').getTime());
-    if (!ts || isNaN(ts)) return false;
+    // Essayer tous les champs de date possibles
+    const ts = normTs(msg.timestamp)
+            || normTs(msg.createdAt)
+            || normTs(msg.created_at)
+            || normTs(msg.date)
+            || normTs(msg.time)
+            || normTs(new Date(msg.created_at || msg.createdAt || msg.date || '').getTime());
+    // Si aucun timestamp trouvé, inclure quand même (le message est récent par définition)
+    if (!ts || isNaN(ts)) return true;
     return ts >= fromTs && ts <= toTs;
   });
+  return filtered;
 }
 
 async function yapsonApprove(msgId) {
@@ -188,7 +197,12 @@ async function yapsonDeepSearch(phone, reqDateTs) {
       const parsed = parseMsg(sender, msg.content || msg.body || msg.message || '');
       if (!parsed) continue;
       if (normPhone(String(parsed.phone)) !== normPhone(String(phone))) continue;
-      const ts = normTs(msg.timestamp) || normTs(new Date(msg.created_at || msg.date || '').getTime());
+      const ts = normTs(msg.timestamp)
+              || normTs(msg.createdAt)
+              || normTs(msg.created_at)
+              || normTs(msg.date)
+              || normTs(new Date(msg.created_at || msg.createdAt || msg.date || '').getTime())
+              || Date.now();
       if (!ts || isNaN(ts)) continue;
       candidates.push({
         phone: parsed.phone,
@@ -468,12 +482,69 @@ async function runF3() {
   const rejectMin = f3Config.rejectMin;
   const now = Date.now();
 
-  // ── ÉTAPE 1 : Fetch TOUS les paiements YapsonPress récents ────
-  // Fenêtre large : depuis 24h en arrière jusqu'à maintenant
-  // (pas de toTs restrictif — on veut TOUS les paiements récents)
-  const yapFromTs = now - (24 * 60 * 60 * 1000); // 24h en arrière
-  const yapToTs   = now; // jusqu'à maintenant (pas de marge ici)
-  log(`F3 [1/5] Fetch YapsonPress (fenêtre 24h)…`);
+  // ── ÉTAPE 1 : Lire my-managment pour trouver la date de référence ─
+  // La date de référence = heure de la PLUS ANCIENNE commande en attente.
+  // On fetchera YapsonPress depuis cette heure-là.
+  log('F3 [1/5] Lecture my-managment pour date de référence…');
+  await page.goto(`${MGMT_URL}/fr/admin/report/pendingrequestrefill`, { waitUntil: 'networkidle', timeout: 30000 });
+  try {
+    const toggleEl = await page.$('.toggle--is-checked, [class*="toggle"][class*="active"], input[type="checkbox"].toggle');
+    if (toggleEl) { await toggleEl.dispatchEvent('click'); await page.waitForTimeout(500); }
+    const ms = await page.$('.input-group.select-box .multiselect');
+    if (ms) {
+      const current = await page.$eval('.multiselect__single', el => el.textContent.trim()).catch(() => '');
+      if (current !== '500') {
+        const selectBtn = await ms.$('.multiselect__select');
+        if (selectBtn) { await selectBtn.click(); await page.waitForTimeout(400); }
+        const options = await ms.$$('.multiselect__element');
+        for (const opt of options) {
+          if ((await opt.textContent()).trim() === '500') { await opt.$('span')?.click(); break; }
+        }
+        await page.waitForTimeout(300);
+      }
+    }
+    const applyBtn = await page.$('button:has-text("Appliquer"), button:has-text("APPLIQUER")');
+    if (applyBtn) { await applyBtn.click(); await page.waitForTimeout(3000); }
+  } catch(e) { log(`⚠ Setup tableau: ${e.message.substring(0, 80)}`); }
+
+  // Lire toutes les lignes en attente
+  const mgmtRows = [];
+  {
+    const rowLocs = page.locator('table tbody tr');
+    const rCount  = await rowLocs.count();
+    for (let ri = 0; ri < rCount; ri++) {
+      try {
+        const rh = rowLocs.nth(ri);
+        const cells = await rh.locator('td').allInnerTexts();
+        if (cells.length < 5) continue;
+        const pm = (cells[1] || '').match(/(0\d{9})/);
+        if (!pm) continue;
+        const hasConfirm = (await rh.locator('a').allInnerTexts()).some(t => t.trim() === 'Confirmer');
+        if (!hasConfirm) continue;
+        mgmtRows.push({
+          ri,
+          phone:  normPhone(pm[1]),
+          amount: parseAmount(cells[2]),
+          dateTs: parseMgmtDate(cells[0])?.getTime() ?? (now - 60 * 60 * 1000),
+          handle: rh,
+        });
+      } catch(e) { /* ignore */ }
+    }
+  }
+  if (mgmtRows.length === 0) { log('F3 — Aucune demande en attente. Fin.'); return; }
+  log(`F3 — ${mgmtRows.length} demande(s) en attente dans my-managment`);
+
+  // Date de référence = plus ancienne commande
+  const oldestTs  = Math.min(...mgmtRows.map(r => r.dateTs));
+  const oldestStr = new Date(oldestTs).toLocaleTimeString('fr-FR');
+  log(`F3 — Plus ancienne demande : ${oldestStr} → référence YapsonPress`);
+
+  // Fetch YapsonPress depuis la plus ancienne commande jusqu'à (now - marginMin)
+  // La marge exclut les paiements trop récents — ils seront pris au prochain cycle
+  const yapFromTs = oldestTs;
+  const yapToTs   = now - (marginMin * 60 * 1000);
+  const toStr     = new Date(yapToTs).toLocaleTimeString('fr-FR');
+  log(`F3 [1/5→] Fetch YapsonPress de ${oldestStr} à ${toStr} (marge ${marginMin} min)…`);
 
   let allYapMessages;
   try {
@@ -492,7 +563,14 @@ async function runF3() {
     if (!parsed) continue;
     const phone = normPhone(String(parsed.phone));
     if (!phone) continue;
-    const ts = normTs(msg.timestamp) || normTs(new Date(msg.created_at || msg.date || '').getTime()) || 0;
+    // Essayer tous les champs de date possibles
+    const ts = normTs(msg.timestamp)
+            || normTs(msg.createdAt)
+            || normTs(msg.created_at)
+            || normTs(msg.date)
+            || normTs(msg.time)
+            || normTs(new Date(msg.created_at || msg.createdAt || msg.date || '').getTime())
+            || now; // si aucun timestamp, considérer comme maintenant
     if (!yapMap[phone]) yapMap[phone] = [];
     yapMap[phone].push({
       phone,
@@ -506,31 +584,7 @@ async function runF3() {
   const yapPhones = Object.keys(yapMap);
   log(`F3 — ${yapPhones.length} numéro(s) unique(s) dans YapsonPress : ${yapPhones.slice(0,8).join(' | ')}${yapPhones.length > 8 ? '…' : ''}`);
 
-  // ── ÉTAPE 2 : Lire les demandes en attente dans my-managment ──
-  log('F3 [2/5] Lecture du tableau Pending deposit requests…');
-  await page.goto(`${MGMT_URL}/fr/admin/report/pendingrequestrefill`, { waitUntil: 'networkidle', timeout: 30000 });
-
-  try {
-    // Désactiver l'autorefresh
-    const toggleEl = await page.$('.toggle--is-checked, [class*="toggle"][class*="active"], input[type="checkbox"].toggle');
-    if (toggleEl) { await toggleEl.dispatchEvent('click'); await page.waitForTimeout(500); }
-    // Sélectionner 500 lignes via le multiselect Vue.js
-    const ms = await page.$('.input-group.select-box .multiselect');
-    if (ms) {
-      const current = await page.$eval('.multiselect__single', el => el.textContent.trim()).catch(() => '');
-      if (current !== '500') {
-        const selectBtn = await ms.$('.multiselect__select');
-        if (selectBtn) { await selectBtn.click(); await page.waitForTimeout(400); }
-        const options = await ms.$$('.multiselect__element');
-        for (const opt of options) {
-          if ((await opt.textContent()).trim() === '500') { await opt.$('span')?.click(); break; }
-        }
-        await page.waitForTimeout(300);
-      }
-    }
-    const applyBtn = await page.$('button:has-text("Appliquer"), button:has-text("APPLIQUER")');
-    if (applyBtn) { await applyBtn.click(); await page.waitForTimeout(3000); }
-  } catch(e) { log(`⚠ Setup tableau: ${e.message.substring(0, 80)}`); }
+  // ── ÉTAPE 2 : (my-managment déjà lu à l'étape 1) ───────────────
 
   // ── ÉTAPE 3 : Approuver dans YapsonPress les paiements non encore approuvés ─
   log('F3 [3/5] Approbation dans YapsonPress…');
@@ -547,37 +601,11 @@ async function runF3() {
   state.approved += approvedCount;
 
   // ── ÉTAPE 4 : YapsonPress → my-managment ────────────────────
-  // Itérer sur les PAIEMENTS YapsonPress, chercher la commande
-  // correspondante dans my-managment.
-  // Règle : le paiement doit être POSTÉRIEUR à la commande.
-  // Un client peut payer jusqu'à rejectMin minutes après sa commande.
+  // Itérer sur les paiements YapsonPress (depuis la date de référence),
+  // chercher chaque numéro dans my-managment et confirmer.
   log('F3 [4/5] Confirmation des demandes dans my-managment…');
   let confirmedCount = 0;
   let rejectedCount  = 0;
-
-  // Lire toutes les lignes my-managment en mémoire (pour accès multiple)
-  const mgmtRows = [];
-  const rowLocators = page.locator('table tbody tr');
-  const rowCount = await rowLocators.count();
-  for (let ri = 0; ri < rowCount; ri++) {
-    try {
-      const rowHandle = rowLocators.nth(ri);
-      const cells = await rowHandle.locator('td').allInnerTexts();
-      if (cells.length < 5) continue;
-      const phoneMatch = (cells[1] || '').match(/(0\d{9})/);
-      if (!phoneMatch) continue;
-      const hasConfirm = (await rowHandle.locator('a').allInnerTexts()).some(t => t.trim() === 'Confirmer');
-      if (!hasConfirm) continue;
-      mgmtRows.push({
-        ri,
-        phone:   normPhone(phoneMatch[1]),
-        amount:  parseAmount(cells[2]),
-        dateTs:  parseMgmtDate(cells[0])?.getTime() ?? (now - 60 * 60 * 1000),
-        handle:  rowHandle,
-      });
-    } catch(e) { /* ignorer les lignes illisibles */ }
-  }
-  log(`F3 — ${mgmtRows.length} demande(s) en attente dans my-managment`);
 
   // Ensemble des lignes déjà confirmées (éviter double-confirmation)
   const confirmedRows = new Set();
@@ -587,12 +615,11 @@ async function runF3() {
   // dont le numéro correspond ET dont le paiement est postérieur (≥ dateCommande).
   for (const phone of yapPhones) {
     for (const pmt of yapMap[phone]) {
-      // Règle : pmt.ts >= row.dateTs  →  le paiement est après la commande
-      // Pas de borne haute ici : c'est rejectMin qui décide du rejet éventuel
+      // Le filtre de date est déjà fait via yapFromTs = date plus ancienne commande.
+      // Ici on cherche juste le numéro correspondant dans my-managment.
       const match = mgmtRows.find(row =>
         !confirmedRows.has(row.ri) &&
-        row.phone === pmt.phone &&
-        pmt.ts >= row.dateTs
+        row.phone === pmt.phone
       );
 
       if (!match) continue; // ce paiement n'a pas de demande dans my-managment
